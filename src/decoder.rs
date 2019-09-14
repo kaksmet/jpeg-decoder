@@ -12,6 +12,11 @@ use std::ops::Range;
 use std::sync::Arc;
 use worker::{RowData, PlatformWorker, Worker};
 
+#[cfg(target_arch = "x86")]
+use std::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 pub const MAX_COMPONENTS: usize = 4;
 
 static UNZIGZAG: [u8; 64] = [
@@ -877,7 +882,40 @@ fn color_convert_line_ycck(data: &mut [u8], width: usize) {
 }
 
 fn color_convert_line_cmyk(data: &mut [u8], width: usize) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if width > 302 && is_x86_feature_detected!("avx2")
+        {
+            unsafe { color_convert_line_cmyk_avx2(data, width) };
+            return;
+        }
+    }
+
     for i in 0 .. width {
+        data[i * 4]     = 255 - data[i * 4];
+        data[i * 4 + 1] = 255 - data[i * 4 + 1];
+        data[i * 4 + 2] = 255 - data[i * 4 + 2];
+        data[i * 4 + 3] = 255 - data[i * 4 + 3];
+    }
+}
+
+#[target_feature(enable = "avx2")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn color_convert_line_cmyk_avx2(data: &mut [u8], width: usize) {
+    // We do batches of 8 pixels at a time with SIMD
+    let vec_px = width / 8;
+    for i in 0 .. vec_px
+    {
+        #[allow(clippy::cast_ptr_alignment)]
+        let mut v = _mm256_loadu_si256(data[i..].as_ptr() as *const _);
+        v = _mm256_sub_epi8(_mm256_set1_epi8(255u8 as i8), v);
+        #[allow(clippy::cast_ptr_alignment)]
+        _mm256_storeu_si256(data[i..].as_mut_ptr() as *mut _, v);
+    }
+
+    // The remaining pixels
+    let rem_px = width - vec_px * 8;
+    for i in vec_px .. rem_px {
         data[i * 4]     = 255 - data[i * 4];
         data[i * 4 + 1] = 255 - data[i * 4 + 1];
         data[i * 4 + 2] = 255 - data[i * 4 + 2];
