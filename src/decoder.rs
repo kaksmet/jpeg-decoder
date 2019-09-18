@@ -1,16 +1,24 @@
-use byteorder::ReadBytesExt;
-use error::{Error, Result, UnsupportedFeature};
-use huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable};
-use marker::Marker;
-use parser::{AdobeColorTransform, AppData, CodingProcess, Component, Dimensions, EntropyCoding, FrameInfo,
-             parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos, ScanInfo};
-use upsampler::Upsampler;
 use std::cmp;
 use std::io::Read;
-use std::mem;
-use std::ops::Range;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
-use worker::{RowData, PlatformWorker, Worker};
+
+use byteorder::ReadBytesExt;
+
+use error::{Error, Result, UnsupportedFeature};
+use huffman::{
+    ComponentVec, DhtTables, empty_component_vec, fill_default_mjpeg_tables,
+    HuffmanDecoder, HuffmanTable,
+};
+use huffman::HuffmanTableClass::{AC, DC};
+use marker::Marker;
+use parser::{
+    AdobeColorTransform, AppData, CodingProcess, Component,
+    Dimensions, EntropyCoding, FrameInfo,
+    parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos, ScanInfo,
+};
+use upsampler::Upsampler;
+use worker::{PlatformWorker, RowData, Worker};
 
 pub const MAX_COMPONENTS: usize = 4;
 
@@ -52,10 +60,8 @@ pub struct Decoder<R> {
     reader: R,
 
     frame: Option<FrameInfo>,
-    dc_huffman_tables: Vec<Option<HuffmanTable>>,
-    ac_huffman_tables: Vec<Option<HuffmanTable>>,
-    quantization_tables: [Option<Arc<[u16; 64]>>; 4],
-
+    huffman_tables: DhtTables,
+    quantization_tables: ComponentVec<Arc<[u16; 64]>>,
     restart_interval: u16,
     color_transform: Option<AdobeColorTransform>,
     is_jfif: bool,
@@ -71,11 +77,10 @@ impl<R: Read> Decoder<R> {
     /// Creates a new `Decoder` using the reader `reader`.
     pub fn new(reader: R) -> Decoder<R> {
         Decoder {
-            reader: reader,
+            reader,
             frame: None,
-            dc_huffman_tables: vec![None, None, None, None],
-            ac_huffman_tables: vec![None, None, None, None],
-            quantization_tables: [None, None, None, None],
+            huffman_tables: DhtTables::new(),
+            quantization_tables: empty_component_vec(),
             restart_interval: 0,
             color_transform: None,
             is_jfif: false,
@@ -102,7 +107,7 @@ impl<R: Read> Decoder<R> {
                 Some(ImageInfo {
                     width: frame.image_size.width,
                     height: frame.image_size.height,
-                    pixel_format: pixel_format,
+                    pixel_format,
                 })
             },
             None => None,
@@ -199,7 +204,7 @@ impl<R: Read> Decoder<R> {
                     let frame = self.frame.clone().unwrap();
                     let scan = parse_sos(&mut self.reader, &frame)?;
 
-                    if frame.coding_process == CodingProcess::DctProgressive && self.coefficients.is_empty() {
+                    if self.coefficients.is_empty() {
                         self.coefficients = frame.components.iter().map(|c| {
                             let block_count = c.block_size.width as usize * c.block_size.height as usize;
                             vec![0; block_count * 64]
@@ -215,7 +220,7 @@ impl<R: Read> Decoder<R> {
                     }
 
                     let is_final_scan = scan.component_indices.iter().all(|&i| self.coefficients_finished[i] == !0);
-                    let (marker, data) = self.decode_scan(&frame, &scan, worker.as_mut().unwrap(), is_final_scan)?;
+                    let ScanData { marker, data } = self.decode_scan(&frame, &scan, worker.as_mut().unwrap(), is_final_scan)?;
 
                     if let Some(data) = data {
                         for (i, plane) in data.into_iter().enumerate().filter(|&(_, ref plane)| !plane.is_empty()) {
@@ -232,7 +237,7 @@ impl<R: Read> Decoder<R> {
                 Marker::DQT => {
                     let tables = parse_dqt(&mut self.reader)?;
 
-                    for (i, &table) in tables.into_iter().enumerate() {
+                    for (i, &table) in tables.iter().enumerate() {
                         if let Some(table) = table {
                             let mut unzigzagged_table = [0u16; 64];
 
@@ -247,19 +252,7 @@ impl<R: Read> Decoder<R> {
                 // Huffman table-specification
                 Marker::DHT => {
                     let is_baseline = self.frame.as_ref().map(|frame| frame.is_baseline);
-                    let (dc_tables, ac_tables) = parse_dht(&mut self.reader, is_baseline)?;
-
-                    let current_dc_tables = mem::replace(&mut self.dc_huffman_tables, vec![]);
-                    self.dc_huffman_tables = dc_tables.into_iter()
-                                                      .zip(current_dc_tables.into_iter())
-                                                      .map(|(a, b)| a.or(b))
-                                                      .collect();
-
-                    let current_ac_tables = mem::replace(&mut self.ac_huffman_tables, vec![]);
-                    self.ac_huffman_tables = ac_tables.into_iter()
-                                                      .zip(current_ac_tables.into_iter())
-                                                      .map(|(a, b)| a.or(b))
-                                                      .collect();
+                    self.huffman_tables.update(parse_dht(&mut self.reader, is_baseline)?);
                 },
                 // Arithmetic conditioning table-specification
                 Marker::DAC => return Err(Error::Unsupported(UnsupportedFeature::ArithmeticEntropyCoding)),
@@ -358,7 +351,7 @@ impl<R: Read> Decoder<R> {
                    scan: &ScanInfo,
                    worker: &mut PlatformWorker,
                    produce_data: bool)
-                   -> Result<(Option<Marker>, Option<Vec<Vec<u8>>>)> {
+                   -> Result<ScanData> {
         assert!(scan.component_indices.len() <= MAX_COMPONENTS);
 
         let components: Vec<Component> = scan.component_indices.iter()
@@ -371,158 +364,65 @@ impl<R: Read> Decoder<R> {
         }
 
         if self.is_mjpeg {
-            fill_default_mjpeg_tables(scan, &mut self.dc_huffman_tables, &mut self.ac_huffman_tables);
+            fill_default_mjpeg_tables(scan, &mut self.huffman_tables);
         }
 
-        // Verify that all required huffman tables has been set.
-        if scan.spectral_selection.start == 0 &&
-                scan.dc_table_indices.iter().any(|&i| self.dc_huffman_tables[i].is_none()) {
-            return Err(Error::Format("scan makes use of unset dc huffman table".to_owned()));
-        }
-        if scan.spectral_selection.end > 1 &&
-                scan.ac_table_indices.iter().any(|&i| self.ac_huffman_tables[i].is_none()) {
-            return Err(Error::Format("scan makes use of unset ac huffman table".to_owned()));
-        }
+        self.check_huffman_tables_for_scan(scan)?;
 
-        if produce_data {
-            // Prepare the worker thread for the work to come.
-            for (i, component) in components.iter().enumerate() {
-                let row_data = RowData {
-                    index: i,
-                    component: component.clone(),
-                    quantization_table: self.quantization_tables[component.quantization_table_index].clone().unwrap(),
-                };
-
-                worker.start(row_data)?;
-            }
-        }
-
-        let blocks_per_mcu: Vec<u16> = components.iter()
-                                                 .map(|c| c.horizontal_sampling_factor as u16 * c.vertical_sampling_factor as u16)
-                                                 .collect();
-        let is_progressive = frame.coding_process == CodingProcess::DctProgressive;
         let is_interleaved = components.len() > 1;
-        let mut dummy_block = [0i16; 64];
-        let mut huffman = HuffmanDecoder::new();
-        let mut dc_predictors = [0i16; MAX_COMPONENTS];
-        let mut mcus_left_until_restart = self.restart_interval;
-        let mut expected_rst_num = 0;
-        let mut eob_run = 0;
-        let mut mcu_row_coefficients = Vec::with_capacity(components.len());
 
-        if produce_data && !is_progressive {
-            for component in &components {
-                let coefficients_per_mcu_row = component.block_size.width as usize * component.vertical_sampling_factor as usize * 64;
-                mcu_row_coefficients.push(vec![0i16; coefficients_per_mcu_row]);
-            }
-        }
+        let mut decode_state = DecodeScanState::new(produce_data, self.restart_interval);
 
         for mcu_y in 0 .. frame.mcu_size.height {
             for mcu_x in 0 .. frame.mcu_size.width {
                 for (i, component) in components.iter().enumerate() {
-                    for j in 0 .. blocks_per_mcu[i] {
-                        let (block_x, block_y) = if is_interleaved {
-                            // Section A.2.3
-                            (mcu_x * component.horizontal_sampling_factor as u16 + j % component.horizontal_sampling_factor as u16,
-                             mcu_y * component.vertical_sampling_factor as u16 + j / component.horizontal_sampling_factor as u16)
+                    let coefficient_line = &mut self.coefficients[scan.component_indices[i]];
+                    decode_state.new_component(i, component, worker, &self.quantization_tables)?;
+                    for j in 0 .. component.blocks_per_mcu() {
+                        let (block_x, block_y) = block_position(frame, is_interleaved, (mcu_x, mcu_y), component, j);
+                        if !is_interleaved && (block_x * 8 >= component.size.width || block_y * 8 >= component.size.height) {
+                            continue;
                         }
-                        else {
-                            // Section A.2.2
-
-                            let blocks_per_row = component.block_size.width as usize;
-                            let block_num = (mcu_y as usize * frame.mcu_size.width as usize +
-                                mcu_x as usize) * blocks_per_mcu[i] as usize + j as usize;
-
-                            let x = (block_num % blocks_per_row) as u16;
-                            let y = (block_num / blocks_per_row) as u16;
-
-                            if x * 8 >= component.size.width || y * 8 >= component.size.height {
-                                continue;
-                            }
-
-                            (x, y)
-                        };
 
                         let block_offset = (block_y as usize * component.block_size.width as usize + block_x as usize) * 64;
-                        let mcu_row_offset = mcu_y as usize * component.block_size.width as usize * component.vertical_sampling_factor as usize * 64;
-                        let coefficients = if is_progressive {
-                            &mut self.coefficients[scan.component_indices[i]][block_offset .. block_offset + 64]
-                        } else if produce_data {
-                            &mut mcu_row_coefficients[i][block_offset - mcu_row_offset .. block_offset - mcu_row_offset + 64]
-                        } else {
-                            &mut dummy_block[..]
-                        };
+                        let mut coefficients = &mut coefficient_line[block_offset..block_offset + 64];
 
                         if scan.successive_approximation_high == 0 {
                             decode_block(&mut self.reader,
-                                         coefficients,
-                                         &mut huffman,
-                                         self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref(),
-                                         self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
-                                         scan.spectral_selection.clone(),
-                                         scan.successive_approximation_low,
-                                         &mut eob_run,
-                                         &mut dc_predictors[i])?;
+                                         &mut coefficients,
+                                         &mut decode_state,
+                                         &self.huffman_tables,
+                                         scan)?;
                         }
                         else {
                             decode_block_successive_approximation(&mut self.reader,
-                                                                  coefficients,
-                                                                  &mut huffman,
-                                                                  self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
-                                                                  scan.spectral_selection.clone(),
-                                                                  scan.successive_approximation_low,
-                                                                  &mut eob_run)?;
+                                                                  &mut coefficients,
+                                                                  &mut decode_state,
+                                                                  self.huffman_tables[AC][scan.ac_table_indices[i]].as_ref(),
+                                                                  scan)?;
                         }
                     }
                 }
 
-                if self.restart_interval > 0 {
-                    let is_last_mcu = mcu_x == frame.mcu_size.width - 1 && mcu_y == frame.mcu_size.height - 1;
-                    mcus_left_until_restart -= 1;
-
-                    if mcus_left_until_restart == 0 && !is_last_mcu {
-                        match huffman.take_marker(&mut self.reader)? {
-                            Some(Marker::RST(n)) => {
-                                if n != expected_rst_num {
-                                    return Err(Error::Format(format!("found RST{} where RST{} was expected", n, expected_rst_num)));
-                                }
-
-                                huffman.reset();
-                                // Section F.2.1.3.1
-                                dc_predictors = [0i16; MAX_COMPONENTS];
-                                // Section G.1.2.2
-                                eob_run = 0;
-
-                                expected_rst_num = (expected_rst_num + 1) % 8;
-                                mcus_left_until_restart = self.restart_interval;
-                            },
-                            Some(marker) => return Err(Error::Format(format!("found marker {:?} inside scan where RST{} was expected", marker, expected_rst_num))),
-                            None => return Err(Error::Format(format!("no marker found where RST{} was expected", expected_rst_num))),
-                        }
-                    }
-                }
+                let is_last_mcu = mcu_x == frame.mcu_size.width - 1 && mcu_y == frame.mcu_size.height - 1;
+                decode_state.advance_mcu(&mut self.reader, is_last_mcu)?;
             }
 
             if produce_data {
-                // Send the coefficients from this MCU row to the worker thread for dequantization and idct.
                 for (i, component) in components.iter().enumerate() {
+                    // Send the coefficients from this MCU row to the worker thread for dequantization and idct.
                     let coefficients_per_mcu_row = component.block_size.width as usize * component.vertical_sampling_factor as usize * 64;
-
-                    let row_coefficients = if is_progressive {
-                        let offset = mcu_y as usize * coefficients_per_mcu_row;
-                        self.coefficients[scan.component_indices[i]][offset .. offset + coefficients_per_mcu_row].to_vec()
-                    } else {
-                        mem::replace(&mut mcu_row_coefficients[i], vec![0i16; coefficients_per_mcu_row])
-                    };
-
+                    let offset = mcu_y as usize * coefficients_per_mcu_row;
+                    let coefficient_line = &mut self.coefficients[scan.component_indices[i]];
+                    let row_coefficients = coefficient_line[offset..offset + coefficients_per_mcu_row].to_vec();
                     worker.append_row((i, row_coefficients))?;
                 }
             }
         }
 
-        let marker = huffman.take_marker(&mut self.reader)?;
+        let marker = decode_state.huffman.take_marker(&mut self.reader)?;
 
-        if produce_data {
+        let data = if produce_data {
             // Retrieve all the data from the worker thread.
             let mut data = vec![Vec::new(); frame.components.len()];
 
@@ -530,95 +430,125 @@ impl<R: Read> Decoder<R> {
                 data[component_index] = worker.get_result(i)?;
             }
 
-            Ok((marker, Some(data)))
+            Some(data)
+        } else { None };
+        Ok(ScanData { marker, data })
+    }
+
+    /// Verify that all required huffman tables have been set.
+    #[inline]
+    fn check_huffman_tables_for_scan(&mut self, scan: &ScanInfo) -> Result<()> {
+        if *scan.spectral_selection.start() == 0 &&
+            scan.dc_table_indices.iter().any(|&i| self.huffman_tables[DC][i].is_none()) {
+            Err(Error::Format("scan makes use of unset dc huffman table".to_owned()))
+        } else if *scan.spectral_selection.end() > 0 &&
+            scan.ac_table_indices.iter().any(|&i| self.huffman_tables[AC][i].is_none()) {
+            Err(Error::Format("scan makes use of unset ac huffman table".to_owned()))
+        } else {
+            Ok(())
         }
-        else {
-            Ok((marker, None))
-        }
+    }
+}
+
+#[inline]
+fn block_position(
+    frame: &FrameInfo,
+    is_interleaved: bool,
+    (mcu_x, mcu_y): (u16, u16),
+    component: &Component,
+    block_index: u16) -> (u16, u16) {
+    let sampling_h = u16::from(component.horizontal_sampling_factor);
+    let sampling_v = u16::from(component.vertical_sampling_factor);
+
+    if is_interleaved {
+        // Section A.2.3
+        (mcu_x * sampling_h + block_index % sampling_h,
+         mcu_y * sampling_v + block_index / sampling_h)
+    } else {
+        // Section A.2.2
+        let blocks_per_row = component.block_size.width as usize;
+        let block_num = block_index as usize +
+            (mcu_y as usize * frame.mcu_size.width as usize + mcu_x as usize) *
+                (sampling_h * sampling_v) as usize;
+
+        let x = (block_num % blocks_per_row) as u16;
+        let y = (block_num / blocks_per_row) as u16;
+
+        (x, y)
     }
 }
 
 fn decode_block<R: Read>(reader: &mut R,
                          coefficients: &mut [i16],
-                         huffman: &mut HuffmanDecoder,
-                         dc_table: Option<&HuffmanTable>,
-                         ac_table: Option<&HuffmanTable>,
-                         spectral_selection: Range<u8>,
-                         successive_approximation_low: u8,
-                         eob_run: &mut u16,
-                         dc_predictor: &mut i16) -> Result<()> {
+                         decode_state: &mut DecodeScanState,
+                         huffman_tables: &DhtTables,
+                         scan: &ScanInfo) -> Result<()> {
     debug_assert_eq!(coefficients.len(), 64);
 
-    if spectral_selection.start == 0 {
+    let idx = decode_state.component_idx;
+
+    if *scan.spectral_selection.start() == 0 {
         // Section F.2.2.1
         // Figure F.12
-        let value = huffman.decode(reader, dc_table.unwrap())?;
+        let dc_table = huffman_tables[DC][scan.dc_table_indices[idx]].as_ref().unwrap();
+        let value = decode_state.huffman.decode(reader, dc_table)?;
         let diff = match value {
             0 => 0,
-            _ => {
+            value if value > 11 => {
                 // Section F.1.2.1.1
                 // Table F.1
-                if value > 11 {
-                    return Err(Error::Format("invalid DC difference magnitude category".to_owned()));
-                }
-
-                huffman.receive_extend(reader, value)?
-            },
+                return Err(Error::Format("invalid DC difference magnitude category".to_owned()));
+            }
+            count => decode_state.huffman.receive_extend(reader, count)?,
         };
 
+        let dc_predictor = &mut decode_state.dc_predictors[idx];
         // Malicious JPEG files can cause this add to overflow, therefore we use wrapping_add.
         // One example of such a file is tests/crashtest/images/dc-predictor-overflow.jpg
         *dc_predictor = dc_predictor.wrapping_add(diff);
-        coefficients[0] = *dc_predictor << successive_approximation_low;
+        coefficients[0] = *dc_predictor << scan.successive_approximation_low;
     }
 
-    let mut index = cmp::max(spectral_selection.start, 1);
+    let mut index = cmp::max(*scan.spectral_selection.start(), 1);
 
-    if index < spectral_selection.end && *eob_run > 0 {
-        *eob_run -= 1;
+    if index <= *scan.spectral_selection.end() && decode_state.eob_run > 0 {
+        decode_state.eob_run -= 1;
         return Ok(());
     }
 
+    let ac_table = huffman_tables[AC][scan.ac_table_indices[idx]].as_ref();
+
     // Section F.1.2.2.1
-    while index < spectral_selection.end {
-        if let Some((value, run)) = huffman.decode_fast_ac(reader, ac_table.unwrap())? {
+    while index <= *scan.spectral_selection.end() {
+        if let Some((value, run)) = decode_state.huffman.decode_fast_ac(reader, ac_table.unwrap())? {
             index += run;
 
-            if index >= spectral_selection.end {
+            if index > *scan.spectral_selection.end() {
                 break;
             }
 
-            coefficients[UNZIGZAG[index as usize] as usize] = value << successive_approximation_low;
+            coefficients[UNZIGZAG[index as usize] as usize] = value << scan.successive_approximation_low;
             index += 1;
         }
         else {
-            let byte = huffman.decode(reader, ac_table.unwrap())?;
-            let r = byte >> 4;
-            let s = byte & 0x0f;
-
-            if s == 0 {
-                match r {
-                    15 => index += 16, // Run length of 16 zero coefficients.
-                    _  => {
-                        *eob_run = (1 << r) - 1;
-
-                        if r > 0 {
-                            *eob_run += huffman.get_bits(reader, r)?;
-                        }
-
-                        break;
-                    },
-                }
-            }
-            else {
-                index += r;
-
-                if index >= spectral_selection.end {
+            let byte = decode_state.huffman.decode(reader, ac_table.unwrap())?;
+            match (byte >> 4, byte & 0x0f) { // Match on higher and lower 4 bits
+                (15, 0) => index += 16, // Run length of 16 zero coefficients.
+                (r, 0) => {
+                    decode_state.advance_eob(reader, r)?;
                     break;
-                }
+                },
+                (r, s) => {
+                    index += r;
 
-                coefficients[UNZIGZAG[index as usize] as usize] = huffman.receive_extend(reader, s)? << successive_approximation_low;
-                index += 1;
+                    if index > *scan.spectral_selection.end() {
+                        break;
+                    }
+
+                    coefficients[UNZIGZAG[index as usize] as usize] =
+                        decode_state.huffman.receive_extend(reader, s)? << scan.successive_approximation_low;
+                    index += 1;
+                }
             }
         }
     }
@@ -626,80 +556,61 @@ fn decode_block<R: Read>(reader: &mut R,
     Ok(())
 }
 
+struct ScanData {
+    marker: Option<Marker>,
+    data: Option<Vec<Vec<u8>>>,
+}
+
 fn decode_block_successive_approximation<R: Read>(reader: &mut R,
                                                   coefficients: &mut [i16],
-                                                  huffman: &mut HuffmanDecoder,
+                                                  decode_state: &mut DecodeScanState,
                                                   ac_table: Option<&HuffmanTable>,
-                                                  spectral_selection: Range<u8>,
-                                                  successive_approximation_low: u8,
-                                                  eob_run: &mut u16) -> Result<()> {
+                                                  scan: &ScanInfo) -> Result<()> {
     debug_assert_eq!(coefficients.len(), 64);
+    let bit = 1 << scan.successive_approximation_low;
 
-    let bit = 1 << successive_approximation_low;
-
-    if spectral_selection.start == 0 {
+    if *scan.spectral_selection.start() == 0 {
         // Section G.1.2.1
 
-        if huffman.get_bits(reader, 1)? == 1 {
+        if decode_state.huffman.get_bits(reader, 1)? == 1 {
             coefficients[0] |= bit;
         }
     }
     else {
         // Section G.1.2.3
 
-        if *eob_run > 0 {
-            *eob_run -= 1;
-            refine_non_zeroes(reader, coefficients, huffman, spectral_selection, 64, bit)?;
+        if decode_state.eob_run > 0 {
+            decode_state.eob_run -= 1;
+            refine_non_zeroes(reader, coefficients, &mut decode_state.huffman, scan.spectral_selection.clone(), 64, bit)?;
             return Ok(());
         }
 
-        let mut index = spectral_selection.start;
+        let mut index = *scan.spectral_selection.start();
 
-        while index < spectral_selection.end {
-            let byte = huffman.decode(reader, ac_table.unwrap())?;
-            let r = byte >> 4;
-            let s = byte & 0x0f;
-
-            let mut zero_run_length = r;
-            let mut value = 0;
-
-            match s {
-                0 => {
-                    match r {
-                        15 => {
-                            // Run length of 16 zero coefficients.
-                            // We don't need to do anything special here, zero_run_length is 15
-                            // and then value (which is zero) gets written, resulting in 16
-                            // zero coefficients.
-                        },
-                        _ => {
-                            *eob_run = (1 << r) - 1;
-
-                            if r > 0 {
-                                *eob_run += huffman.get_bits(reader, r)?;
-                            }
-
-                            // Force end of block.
-                            zero_run_length = 64;
-                        },
-                    }
+        while index <= *scan.spectral_selection.end() {
+            let byte = decode_state.huffman.decode(reader, ac_table.unwrap())?;
+            let (zero_run_length, value) = match (byte >> 4, byte & 0x0f) {
+                (15, 0) => {
+                    // Run length of 16 zero coefficients.
+                    // We don't need to do anything special here, zero_run_length is 15
+                    // and then value (which is zero) gets written, resulting in 16
+                    // zero coefficients.
+                    (15, 0)
                 },
-                1 => {
-                    if huffman.get_bits(reader, 1)? == 1 {
-                        value = bit;
-                    }
-                    else {
-                        value = -bit;
-                    }
+                (r, 0) => {
+                    decode_state.advance_eob(reader, r)?;
+                    (64, 0) // Force end of block.
+                },
+                (r, 1) => {
+                    let opposite = decode_state.huffman.get_bits(reader, 1)? != 1;
+                    (r, if opposite { -bit } else { bit })
                 },
                 _ => return Err(Error::Format("unexpected huffman code".to_owned())),
-            }
-
-            let range = Range {
-                start: index,
-                end: spectral_selection.end,
             };
-            index = refine_non_zeroes(reader, coefficients, huffman, range, zero_run_length, bit)?;
+
+            let range = index ..= *scan.spectral_selection.end();
+
+            index = refine_non_zeroes(reader, coefficients, &mut decode_state.huffman, range, zero_run_length, bit)?;
 
             if value != 0 {
                 coefficients[UNZIGZAG[index as usize] as usize] = value;
@@ -712,15 +623,101 @@ fn decode_block_successive_approximation<R: Read>(reader: &mut R,
     Ok(())
 }
 
+struct DecodeScanState {
+    huffman: HuffmanDecoder,
+    dc_predictors: [i16; MAX_COMPONENTS],
+    mcus_left_until_restart: u16,
+    restart_interval: u16,
+    expected_rst_num: u8,
+    eob_run: u16,
+    last_worker_idx: usize,
+    produce_data: bool,
+    component_idx: usize,
+}
+
+impl DecodeScanState {
+    fn new(produce_data: bool, restart_interval: u16) -> DecodeScanState {
+        DecodeScanState {
+            huffman: HuffmanDecoder::new(),
+            dc_predictors: [0i16; MAX_COMPONENTS],
+            mcus_left_until_restart: restart_interval,
+            restart_interval,
+            expected_rst_num: 0,
+            eob_run: 0,
+            last_worker_idx: 0,
+            produce_data,
+            component_idx: 0
+        }
+    }
+
+    fn new_component(&mut self,
+                     i: usize,
+                     component: &Component,
+                     worker: &mut PlatformWorker,
+                     quantization_tables: &ComponentVec<Arc<[u16; 64]>>,
+    ) -> Result<()> {
+        self.component_idx = i;
+        // seeing this component for the 1st time:
+        if i >= self.last_worker_idx && self.produce_data {
+            self.last_worker_idx += 1;
+            worker.start(RowData {
+                index: i,
+                component: component.clone(),
+                quantization_table: quantization_tables[component.quantization_table_index].clone().unwrap(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn advance_mcu<R: Read>(&mut self, reader: &mut R, is_last_mcu: bool) -> Result<()> {
+        if self.restart_interval == 0 { return Ok(()) }
+
+        self.mcus_left_until_restart -= 1;
+
+        if self.mcus_left_until_restart == 0 && !is_last_mcu {
+            match self.huffman.take_marker(reader)? {
+                Some(Marker::RST(n)) => {
+                    if n != self.expected_rst_num {
+                        return Err(Error::Format(format!("found RST{} where RST{} was expected", n, self.expected_rst_num)));
+                    }
+
+                    self.reset();
+                },
+                Some(marker) => return Err(Error::Format(format!("found marker {:?} inside scan where RST{} was expected", marker, self.expected_rst_num))),
+                None => return Err(Error::Format(format!("no marker found where RST{} was expected", self.expected_rst_num))),
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_eob<R: Read>(&mut self, reader: &mut R, r: u8) -> Result<()> {
+        self.eob_run = (1 << r) - 1;
+        if r > 0 {
+            self.eob_run += self.huffman.get_bits(reader, r)?;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.huffman.reset();
+        // Section F.2.1.3.1
+        self.dc_predictors = [0i16; MAX_COMPONENTS];
+        // Section G.1.2.2
+        self.eob_run = 0;
+        self.expected_rst_num = (self.expected_rst_num + 1) % 8;
+        self.mcus_left_until_restart = self.restart_interval;
+    }
+}
+
 fn refine_non_zeroes<R: Read>(reader: &mut R,
                               coefficients: &mut [i16],
                               huffman: &mut HuffmanDecoder,
-                              range: Range<u8>,
+                              range: RangeInclusive<u8>,
                               zrl: u8,
                               bit: i16) -> Result<u8> {
     debug_assert_eq!(coefficients.len(), 64);
 
-    let last = range.end - 1;
+    let last = *range.end();
     let mut zero_run_length = zrl;
 
     for i in range {
@@ -885,9 +882,9 @@ fn color_convert_line_cmyk(data: &mut [u8], width: usize) {
 
 // ITU-R BT.601
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
-    let y = y as f32;
-    let cb = cb as f32 - 128.0;
-    let cr = cr as f32 - 128.0;
+    let y  = f32::from(y);
+    let cb = f32::from(cb) - 128.0;
+    let cr = f32::from(cr) - 128.0;
 
     let r = y                + 1.40200 * cr;
     let g = y - 0.34414 * cb - 0.71414 * cr;

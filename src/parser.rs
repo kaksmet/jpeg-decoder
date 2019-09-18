@@ -1,10 +1,12 @@
+use std::io::{self, Read};
+use std::ops::RangeInclusive;
+
 use byteorder::{BigEndian, ReadBytesExt};
+
 use error::{Error, Result};
-use huffman::{HuffmanTable, HuffmanTableClass};
+use huffman::{DhtTables, HuffmanTable, HuffmanTableClass};
 use marker::Marker;
 use marker::Marker::*;
-use std::io::{self, Read};
-use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dimensions {
@@ -44,7 +46,7 @@ pub struct ScanInfo {
     pub dc_table_indices: Vec<usize>,
     pub ac_table_indices: Vec<usize>,
 
-    pub spectral_selection: Range<u8>,
+    pub spectral_selection: RangeInclusive<u8>,
     pub successive_approximation_high: u8,
     pub successive_approximation_low: u8,
 }
@@ -60,6 +62,14 @@ pub struct Component {
 
     pub size: Dimensions,
     pub block_size: Dimensions,
+}
+
+impl Component {
+    #[inline]
+    pub fn blocks_per_mcu(&self) -> u16 {
+        u16::from(self.horizontal_sampling_factor) *
+            u16::from(self.vertical_sampling_factor)
+    }
 }
 
 #[derive(Debug)]
@@ -197,9 +207,9 @@ pub fn parse_sof<R: Read>(reader: &mut R, marker: Marker) -> Result<FrameInfo> {
         }
 
         components.push(Component {
-            identifier: identifier,
-            horizontal_sampling_factor: horizontal_sampling_factor,
-            vertical_sampling_factor: vertical_sampling_factor,
+            identifier,
+            horizontal_sampling_factor,
+            vertical_sampling_factor,
             quantization_table_index: quantization_table_index as usize,
             size: Dimensions {width: 0, height: 0},
             block_size: Dimensions {width: 0, height: 0},
@@ -209,27 +219,27 @@ pub fn parse_sof<R: Read>(reader: &mut R, marker: Marker) -> Result<FrameInfo> {
     let h_max = components.iter().map(|c| c.horizontal_sampling_factor).max().unwrap();
     let v_max = components.iter().map(|c| c.vertical_sampling_factor).max().unwrap();
     let mcu_size = Dimensions {
-        width: (width as f32 / (h_max as f32 * 8.0)).ceil() as u16,
-        height: (height as f32 / (v_max as f32 * 8.0)).ceil() as u16,
+        width: (f32::from(width) / (f32::from(h_max) * 8.0)).ceil() as u16,
+        height: (f32::from(height) / (f32::from(v_max) * 8.0)).ceil() as u16,
     };
 
     for component in &mut components {
-        component.size.width = (width as f32 * (component.horizontal_sampling_factor as f32 / h_max as f32)).ceil() as u16;
-        component.size.height = (height as f32 * (component.vertical_sampling_factor as f32 / v_max as f32)).ceil() as u16;
+        component.size.width = (f32::from(width) * (f32::from(component.horizontal_sampling_factor) / f32::from(h_max))).ceil() as u16;
+        component.size.height = (f32::from(height) * (f32::from(component.vertical_sampling_factor) / f32::from(v_max))).ceil() as u16;
 
-        component.block_size.width = mcu_size.width * component.horizontal_sampling_factor as u16;
-        component.block_size.height = mcu_size.height * component.vertical_sampling_factor as u16;
+        component.block_size.width = mcu_size.width * u16::from(component.horizontal_sampling_factor);
+        component.block_size.height = mcu_size.height * u16::from(component.vertical_sampling_factor);
     }
 
     Ok(FrameInfo {
-        is_baseline: is_baseline,
-        is_differential: is_differential,
-        coding_process: coding_process,
-        entropy_coding: entropy_coding,
-        precision: precision,
-        image_size: Dimensions {width: width, height: height},
-        mcu_size: mcu_size,
-        components: components,
+        is_baseline,
+        is_differential,
+        coding_process,
+        entropy_coding,
+        precision,
+        image_size: Dimensions {width, height },
+        mcu_size,
+        components,
     })
 }
 
@@ -288,9 +298,11 @@ pub fn parse_sos<R: Read>(reader: &mut R, frame: &FrameInfo) -> Result<ScanInfo>
         ac_table_indices.push(ac_table_index as usize);
     }
 
-    let blocks_per_mcu = component_indices.iter().map(|&i| {
-        frame.components[i].horizontal_sampling_factor as u32 * frame.components[i].vertical_sampling_factor as u32
-    }).fold(0, ::std::ops::Add::add);
+    let blocks_per_mcu: u32 = component_indices.iter()
+        .map(|&i| {
+            u32::from(frame.components[i].horizontal_sampling_factor) *
+                u32::from(frame.components[i].vertical_sampling_factor)
+        }).sum();
 
     if component_count > 1 && blocks_per_mcu > 10 {
         return Err(Error::Format("scan with more than one component and more than 10 blocks per MCU".to_owned()));
@@ -333,15 +345,12 @@ pub fn parse_sos<R: Read>(reader: &mut R, frame: &FrameInfo) -> Result<ScanInfo>
     }
 
     Ok(ScanInfo {
-        component_indices: component_indices,
-        dc_table_indices: dc_table_indices,
-        ac_table_indices: ac_table_indices,
-        spectral_selection: Range {
-            start: spectral_selection_start,
-            end: spectral_selection_end + 1,
-        },
-        successive_approximation_high: successive_approximation_high,
-        successive_approximation_low: successive_approximation_low,
+        component_indices,
+        dc_table_indices,
+        ac_table_indices,
+        spectral_selection: spectral_selection_start..=spectral_selection_end,
+        successive_approximation_high,
+        successive_approximation_low,
     })
 }
 
@@ -364,9 +373,12 @@ pub fn parse_dqt<R: Read>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
         //      shall be zero for 8 bit sample precision P (see B.2.2)."
         // libjpeg allows this behavior though, and there are images in the wild using it. So to
         // match libjpeg's behavior we are deviating from the JPEG spec here.
-        if precision > 1 {
-            return Err(Error::Format(format!("invalid precision {} in DQT", precision)));
-        }
+        let is_precise = match precision {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Format(format!("invalid precision {} in DQT", precision)))
+        };
+
         if index > 3 {
             return Err(Error::Format(format!("invalid destination identifier {} in DQT", index)));
         }
@@ -376,11 +388,11 @@ pub fn parse_dqt<R: Read>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
 
         let mut table = [0u16; 64];
 
-        for i in 0 .. 64 {
-            table[i] = match precision {
-                0 => reader.read_u8()? as u16,
-                1 => reader.read_u16::<BigEndian>()?,
-                _ => unreachable!(),
+        for table_value in table.iter_mut() {
+            *table_value = if is_precise {
+                reader.read_u16::<BigEndian>()?
+            } else {
+                u16::from(reader.read_u8()?)
             };
         }
 
@@ -396,10 +408,9 @@ pub fn parse_dqt<R: Read>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
 }
 
 // Section B.2.4.2
-pub fn parse_dht<R: Read>(reader: &mut R, is_baseline: Option<bool>) -> Result<(Vec<Option<HuffmanTable>>, Vec<Option<HuffmanTable>>)> {
+pub fn parse_dht<R: Read>(reader: &mut R, is_baseline: Option<bool>) -> Result<DhtTables> {
     let mut length = read_length(reader, DHT)?;
-    let mut dc_tables = vec![None, None, None, None];
-    let mut ac_tables = vec![None, None, None, None];
+    let mut tables = DhtTables::new();
 
     // Each DHT segment may contain multiple huffman tables.
     while length > 17 {
@@ -407,9 +418,6 @@ pub fn parse_dht<R: Read>(reader: &mut R, is_baseline: Option<bool>) -> Result<(
         let class = byte >> 4;
         let index = (byte & 0x0f) as usize;
 
-        if class != 0 && class != 1 {
-            return Err(Error::Format(format!("invalid class {} in DHT", class)));
-        }
         if is_baseline == Some(true) && index > 1 {
             return Err(Error::Format("a maximum of two huffman tables per class are allowed in baseline".to_owned()));
         }
@@ -435,11 +443,15 @@ pub fn parse_dht<R: Read>(reader: &mut R, is_baseline: Option<bool>) -> Result<(
         let mut values = vec![0u8; size];
         reader.read_exact(&mut values)?;
 
-        match class {
-            0 => dc_tables[index] = Some(HuffmanTable::new(&counts, &values, HuffmanTableClass::DC)?),
-            1 => ac_tables[index] = Some(HuffmanTable::new(&counts, &values, HuffmanTableClass::AC)?),
-            _ => unreachable!(),
-        }
+        let table_type = match class {
+            0 => HuffmanTableClass::DC,
+            1 => HuffmanTableClass::AC,
+            _ => {
+                return Err(Error::Format(format!("invalid class {} in DHT", class)))
+            }
+        };
+
+        tables[table_type][index] = Some(HuffmanTable::new(&counts, &values, table_type)?);
 
         length -= 17 + size;
     }
@@ -448,7 +460,7 @@ pub fn parse_dht<R: Read>(reader: &mut R, is_baseline: Option<bool>) -> Result<(
         return Err(Error::Format("invalid length in DHT".to_owned()));
     }
 
-    Ok((dc_tables, ac_tables))
+    Ok(tables)
 }
 
 // Section B.2.4.4
@@ -486,10 +498,10 @@ pub fn parse_app<R: Read>(reader: &mut R, marker: Marker) -> Result<Option<AppDa
                 bytes_read = buffer.len();
 
                 // http://www.w3.org/Graphics/JPEG/jfif3.pdf
-                if &buffer[0 .. 5] == &[b'J', b'F', b'I', b'F', b'\0'] {
+                if buffer.starts_with(b"JFIF\0") {
                     result = Some(AppData::Jfif);
                 // https://sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#AVI1
-                } else if &buffer[0 .. 5] == &[b'A', b'V', b'I', b'1', b'\0'] {
+                } else if buffer.starts_with(b"AVI1\0") {
                     result = Some(AppData::Avi1);
                 }
             }
@@ -501,7 +513,7 @@ pub fn parse_app<R: Read>(reader: &mut R, marker: Marker) -> Result<Option<AppDa
                 bytes_read = buffer.len();
 
                 // http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
-                if &buffer[0 .. 6] == &[b'A', b'd', b'o', b'b', b'e', b'\0'] {
+                if buffer.starts_with(b"Adobe\0") {
                     let color_transform = match buffer[11] {
                         0 => AdobeColorTransform::Unknown,
                         1 => AdobeColorTransform::YCbCr,
